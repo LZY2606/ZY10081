@@ -1,0 +1,642 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Abide session</title>
+    <style>
+      @font-face {
+        font-family: "SF Mono";
+        src: url("file:///System/Applications/Utilities/Terminal.app/Contents/Resources/Fonts/SF-Mono-Regular.otf")
+          format("opentype");
+        font-weight: 400;
+      }
+      @font-face {
+        font-family: "SF Mono";
+        src: url("file:///System/Applications/Utilities/Terminal.app/Contents/Resources/Fonts/SF-Mono-Bold.otf")
+          format("opentype");
+        font-weight: 700;
+      }
+      :root {
+        /* Claude Code light theme, read from the 2.1.276 binary. */
+        --text: rgb(0, 0, 0);
+        --inactive: rgb(102, 102, 102);
+        --subtle: rgb(175, 175, 175);
+        --success: rgb(44, 122, 57);
+        --error: rgb(171, 43, 63);
+        --claude: rgb(215, 119, 87);
+        --prompt-border: rgb(153, 153, 153);
+        --diff-added: rgb(105, 219, 124);
+        --diff-removed: rgb(255, 168, 180);
+        --user-bg: rgb(240, 240, 240);
+        --font: 29px;
+        --lh: 37px;
+      }
+      html,
+      body {
+        margin: 0;
+        background: #fff;
+      }
+      body {
+        width: 1200px;
+        height: 1200px;
+        overflow: hidden;
+      }
+
+      .window {
+        position: absolute;
+        inset: 0;
+        background: #fff;
+        display: flex;
+        flex-direction: column;
+        transform-origin: 0 0;
+      }
+      .titlebar {
+        height: 28px;
+        flex: none;
+        background: #e9e9e9;
+        border-bottom: 1px solid #cfcfcf;
+        position: relative;
+        font:
+          13px/28px -apple-system,
+          "SF Pro Text",
+          "Helvetica Neue",
+          sans-serif;
+        color: #4a4a4a;
+        text-align: center;
+      }
+      .lights {
+        position: absolute;
+        left: 13px;
+        top: 8px;
+        display: flex;
+        gap: 8px;
+      }
+      .lights i {
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        display: block;
+      }
+      .lights .r {
+        background: #ff5f57;
+        border: 0.5px solid #e0443e;
+      }
+      .lights .y {
+        background: #febc2e;
+        border: 0.5px solid #dea123;
+      }
+      .lights .g {
+        background: #28c840;
+        border: 0.5px solid #1aab29;
+      }
+
+      .term {
+        flex: 1;
+        padding: 10px 10px 0 10px;
+        font-family: "SF Mono", Menlo, monospace;
+        font-size: var(--font);
+        line-height: var(--lh);
+        color: var(--text);
+        white-space: pre;
+        overflow: hidden;
+      }
+      .l {
+        display: none;
+      }
+      .l.on {
+        display: block;
+      }
+
+      .user {
+        background: var(--user-bg);
+      }
+      .user .caret {
+        color: var(--inactive);
+      }
+      .dim {
+        color: var(--inactive);
+      }
+      .sub {
+        color: var(--subtle);
+      }
+      .ok {
+        color: var(--success);
+      }
+      .err {
+        color: var(--error);
+      }
+      .b {
+        font-weight: 700;
+      }
+      .add {
+        background: var(--diff-added);
+      }
+      .del {
+        background: var(--diff-removed);
+      }
+      .hr {
+        color: var(--prompt-border);
+      }
+      @font-face {
+        font-family: "Caveat";
+        src: url("fonts/Caveat.ttf") format("truetype");
+        font-weight: 400 700;
+      }
+      .note {
+        position: absolute;
+        inset: 0;
+        pointer-events: none;
+        overflow: visible;
+      }
+      .note text {
+        font-family: "Caveat", cursive;
+        font-weight: 600;
+        fill: #e4572e;
+      }
+      .note path {
+        fill: none;
+        stroke: #e4572e;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="window">
+      <div class="titlebar">
+        <div class="lights"><i class="r"></i><i class="y"></i><i class="g"></i></div>
+        storefront — claude — 66×32
+      </div>
+      <div class="term" id="term"></div>
+      <svg class="note" id="note" width="1200" height="1200" viewBox="0 0 1200 1200"></svg>
+    </div>
+
+    <script>
+      // Same session as session.html, set at a size that reads on a phone. At this
+      // size the transcript is taller than the window, so this page behaves like the
+      // real terminal: long rows wrap the way Claude Code wraps them, output scrolls
+      // up as it arrives, and the camera tracks the block instead of fixed spots.
+      const FONT = getComputedStyle(document.documentElement).getPropertyValue("--font").trim();
+      const measure = () => {
+        const s = document.createElement("span");
+        s.textContent = "x".repeat(100);
+        s.style.cssText = `font-family:'SF Mono',Menlo,monospace;font-size:${FONT};position:absolute;visibility:hidden;white-space:pre`;
+        document.body.appendChild(s);
+        const w = s.getBoundingClientRect().width / 100;
+        s.remove();
+        return Math.floor((1200 - 20) / w);
+      };
+      let W = 0;
+      const wrap = (text, width) => {
+        const out = [];
+        let line = "";
+        for (const word of text.split(" ")) {
+          if (line && (line + " " + word).length > width) {
+            out.push(line);
+            line = word;
+          } else line = line ? line + " " + word : word;
+        }
+        if (line) out.push(line);
+        return out;
+      };
+      const chunks = (text, width) => {
+        const out = [];
+        for (let i = 0; i < Math.max(1, text.length); i += width)
+          out.push(text.slice(i, i + width));
+        return out;
+      };
+      const pad = (s) => s + " ".repeat(Math.max(0, W - s.length));
+      const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      const gutter = (n) => String(n).padStart(6, " ");
+
+      // A message row: "⏺ " or "❯ " then text, continuation rows indented two.
+      const para = (t, lead, text, cls) =>
+        wrap(text, W - 2).map((row, i) => ({ t, cls, html: (i === 0 ? lead : "  ") + esc(row) }));
+
+      // Diff rows wrap at the column width with the marker repeated, as the real
+      // renderer does ("         +l ? req.body : {};").
+      const diff = (rows, t0, step) =>
+        rows.flatMap((r, i) => {
+          const t = t0 + i * step;
+          if (r === "...") return [{ t, html: `<span class="dim">     ...</span>` }];
+          const [kind, n, text] = r;
+          const width = W - 8;
+          return chunks(text, width).map((piece, j) => {
+            const num = j === 0 ? `<span class="dim">${gutter(n)}</span>` : "      ";
+            if (kind === "+")
+              return { t, html: `${num} <span class="add">${esc(pad("+" + piece))}</span>` };
+            if (kind === "-")
+              return { t, html: `${num} <span class="del">${esc(pad("-" + piece))}</span>` };
+            return { t, html: `${num}  ${esc(piece)}` };
+          });
+        });
+
+      // Fast cut: the recording starts a beat after the first edit, so the poster
+      // frame already shows the guard and the catch lands at 1.5 s.
+      const T = {
+        prompt: 0.0,
+        edit1: 0.0,
+        hook: 1.5,
+        reply: 5.1,
+        edit2: 5.7,
+        done: 8.5,
+        end: 12.5,
+      };
+
+      const ease = (x) => (x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2);
+
+      // Spotlight on the Abide block while the camera is on it.
+      const SPOT = [
+        [1.7, 0],
+        [2.2, 1],
+        [4.6, 1],
+        [5.1, 0],
+      ];
+      const spotlight = (t) => {
+        if (t <= SPOT[0][0] || t >= SPOT[SPOT.length - 1][0]) return 0;
+        for (let i = 0; i < SPOT.length - 1; i++) {
+          const [t0, v0] = SPOT[i],
+            [t1, v1] = SPOT[i + 1];
+          if (t >= t0 && t <= t1) return v0 + (v1 - v0) * ease((t - t0) / (t1 - t0));
+        }
+        return 0;
+      };
+
+      const build = () => [
+        ...para(
+          T.prompt,
+          `<span class="caret">❯</span> `,
+          "In apps/web/src/pages/api/logout.ts, read an optional redirectTo from the JSON body and echo it back.",
+          "user nb",
+        ),
+        { t: T.prompt, html: "" },
+
+        {
+          t: T.edit1,
+          html: `<span class="ok">⏺</span> <span class="b">Update</span>(apps/web/src/pages/api/logout.ts)`,
+        },
+        { t: T.edit1, html: `  <span class="sub">⎿</span>  Added 4 lines, removed 1 line` },
+        ...diff(
+          [
+            [" ", 9, "    return;"],
+            [" ", 10, "  }"],
+            [" ", 11, ""],
+            [
+              "+",
+              12,
+              '  const body = typeof req.body === "object" && req.body !== null ? req.body : {};',
+            ],
+            [
+              "+",
+              13,
+              '  const redirectTo = typeof body.redirectTo === "string" ? body.redirectTo : undefined;',
+            ],
+            ["+", 14, ""],
+            [" ", 15, "  clearSessionCookie(res);"],
+            ["-", 13, "  res.status(200).json({ type: responseTypes.OK });"],
+            ["+", 16, "  res.status(200).json({ type: responseTypes.OK, redirectTo });"],
+            [" ", 17, "}"],
+          ],
+          T.edit1,
+          0,
+        ),
+
+        {
+          t: T.hook,
+          cls: "hook",
+          html: `  <span class="sub">⎿</span>  <span class="err">PostToolUse:Edit hook returned blocking error</span>`,
+        },
+        ...[
+          "Abide: This edit appears to break a rule from this repository's instructions.",
+          '- Rule "api-validation-uses-yup" from AGENTS.md line 65: "When writing API endpoints, do NOT write input validations manually. Use Yup (with clear validation messages) + early return in the API handler". (0.86)',
+          "Repair apps/web/src/pages/api/logout.ts now, then continue with the task.",
+        ]
+          .flatMap((p) => wrap(p, W - 5))
+          .map((row, i) => ({
+            t: T.hook,
+            cls: "hook",
+            html: `${i === 0 ? '  <span class="sub">⎿</span>  ' : "     "}<span class="err">${esc(row)}</span>`,
+          })),
+        { t: T.hook, html: "" },
+
+        ...para(
+          T.reply,
+          "⏺ ",
+          "The repo's rules want Yup for request validation. Replacing the guard with a schema and an early return.",
+        ),
+        { t: T.reply, html: "" },
+
+        {
+          t: T.edit2,
+          cls: "repair",
+          html: `<span class="ok">⏺</span> <span class="b">Update</span>(apps/web/src/pages/api/logout.ts)`,
+        },
+        {
+          t: T.edit2 + 0.15,
+          html: `  <span class="sub">⎿</span>  Added 15 lines, removed 2 lines`,
+        },
+        ...diff(
+          [
+            ["+", 1, 'import * as yup from "yup";'],
+            [" ", 2, 'import type { NextApiRequest, NextApiResponse } from "next";'],
+            [" ", 3, 'import { clearSessionCookie } from "../../lib/session";'],
+            [" ", 4, 'import { responseTypes } from "../../lib/responseTypes";'],
+            [" ", 5, ""],
+            ["+", 6, "const logoutBodySchema = yup.object({"],
+            ["+", 7, "  redirectTo: yup.string().optional(),"],
+            ["+", 8, "});"],
+            ["+", 9, ""],
+            [
+              " ",
+              10,
+              "export default async function handler(req: NextApiRequest, res: NextApiResponse) {",
+            ],
+            "...",
+            [" ", 14, "    return;"],
+            [" ", 15, "  }"],
+            [" ", 16, ""],
+            [
+              "-",
+              12,
+              '  const body = typeof req.body === "object" && req.body !== null ? req.body : {};',
+            ],
+            [
+              "-",
+              13,
+              '  const redirectTo = typeof body.redirectTo === "string" ? body.redirectTo : undefined;',
+            ],
+            ["+", 17, "  let redirectTo: string | undefined;"],
+            ["+", 18, "  try {"],
+            ["+", 19, "    ({ redirectTo } = await logoutBodySchema.validate(req.body ?? {}));"],
+            ["+", 20, "  } catch (error) {"],
+            ["+", 21, "    if (error instanceof yup.ValidationError) {"],
+            [
+              "+",
+              22,
+              '      res.status(400).json({ type: responseTypes.BAD_REQUEST, message: error.errors.join(", ") });',
+            ],
+            ["+", 23, "      return;"],
+            ["+", 24, "    }"],
+            ["+", 25, "    throw error;"],
+            ["+", 26, "  }"],
+            [" ", 27, ""],
+            [" ", 28, "  clearSessionCookie(res);"],
+          ],
+          T.edit2 + 0.3,
+          0.07,
+        ),
+        { t: T.edit2 + 0.3, html: "" },
+
+        ...para(
+          T.done,
+          "⏺ ",
+          "Done. The body is parsed through a Yup schema with an early 400 on a bad value, and redirectTo is echoed back.",
+        ),
+        { t: T.done, html: "" },
+      ];
+      let lines = [];
+
+      const glyphs = ["·", "✢", "✳", "✶", "✻", "✽"];
+      const verbs = [
+        [0, "Crafting…"],
+        [T.hook, "Reconciling…"],
+        [T.edit2 + 0.2, "Finishing…"],
+      ];
+      const tokens = (t) => {
+        const n = Math.round(900 + t * 240);
+        return n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n);
+      };
+      const status = (t) => {
+        if (t >= T.done + 0.4)
+          return `<span class="dim">✻ Crunched for ${Math.round(T.done + 3)}s · done 12:41 PM</span>`;
+        const g = glyphs[Math.floor(t * 8) % glyphs.length];
+        const verb = verbs.filter(([at]) => t >= at).pop()[1];
+        return `<span style="color:var(--claude)">${g}</span> ${verb} <span class="dim">(${Math.floor(t + 6)}s · ↓ ${tokens(t)} tokens)</span>`;
+      };
+      const footer = () =>
+        [
+          "",
+          `<span class="hr">${"─".repeat(W)}</span>`,
+          `<span class="caret">❯</span> `,
+          `<span class="hr">${"─".repeat(W)}</span>`,
+          `  <span class="dim">⏵⏵ accept edits on (shift+tab to cycle)</span>`,
+        ].join("\n");
+
+      const term = document.getElementById("term");
+      const live = document.createElement("div");
+      const win = document.querySelector(".window");
+      const init = () => {
+        W = measure();
+        lines = build();
+        term.innerHTML = "";
+        for (const ln of lines) {
+          const d = document.createElement("div");
+          d.className = "l " + (ln.cls ?? "");
+          d.dataset.t = ln.t;
+          d.innerHTML = ln.html || " ";
+          term.appendChild(d);
+        }
+        term.appendChild(live);
+      };
+
+      // Where a block sits in window coordinates at scale 1, after scrolling.
+      const blockBox = (sel) => {
+        const els = [...term.querySelectorAll(sel + ".on")];
+        if (els.length === 0) return null;
+        const top = els[0].offsetTop - term.scrollTop + term.offsetTop;
+        const bottom =
+          els[els.length - 1].offsetTop +
+          els[els.length - 1].offsetHeight -
+          term.scrollTop +
+          term.offsetTop;
+        return { top, bottom, mid: (top + bottom) / 2 };
+      };
+
+      // No zoom in this cut: at 66 columns the block already spans the frame, so
+      // the spotlight and the terminal's own scrolling carry the shot. The camera
+      // stays in the code so a zoom can be re-enabled by editing CAM.
+      const Z = 1.5;
+      const clampY = (cy, s) => Math.min(1200 - 600 / s, Math.max(600 / s, cy));
+      const shots = {
+        full: () => [1, 600, 600],
+        hook: () => {
+          const b = blockBox(".hook");
+          return [Z, 600 / Z, clampY(b ? b.mid - 120 : 600, Z)];
+        },
+        tail: () => [Z, 600 / Z, 1200 - 600 / Z],
+      };
+      const CAM = [
+        [0.0, "full"],
+        [12.5, "full"],
+      ];
+      const camera = (t) => {
+        let a = CAM[0],
+          b = CAM[CAM.length - 1];
+        for (let i = 0; i < CAM.length - 1; i++)
+          if (t >= CAM[i][0] && t <= CAM[i + 1][0]) {
+            a = CAM[i];
+            b = CAM[i + 1];
+            break;
+          }
+        if (t >= b[0]) a = b;
+        const k = a === b ? 1 : ease((t - a[0]) / (b[0] - a[0]));
+        const A = shots[a[1]](),
+          B = shots[b[1]]();
+        const [s, cx, cy] = [0, 1, 2].map((j) => A[j] + (B[j] - A[j]) * k);
+        win.style.transform = `translate(${600 - cx * s}px, ${600 - cy * s}px) scale(${s})`;
+      };
+
+      // The terminal keeps its newest output in view. At the end the viewer scrolls
+      // back up so the catch and the repair share the final frame.
+      const scroll = (t) => {
+        const bottom = term.scrollHeight - term.clientHeight;
+        const hook = term.querySelector(".hook.on");
+        const up = hook ? Math.max(0, hook.offsetTop - term.offsetTop - 1 * 37) : 0;
+        const t0 = 8.9,
+          t1 = 10.0;
+        const k = t <= t0 ? 0 : t >= t1 ? 1 : ease((t - t0) / (t1 - t0));
+        term.scrollTop = bottom + (Math.min(up, bottom) - bottom) * k;
+      };
+
+      // Hand-drawn notes: ink on the recording. Each note names the row it points
+      // at, where the text sits relative to that row, and when it draws and fades.
+      // They live inside the window so the camera treats them as part of the frame.
+      const NOTES = [
+        {
+          text: "Jev caught this",
+          row: ".hook",
+          anchor: "start",
+          place: "above",
+          at: 2.3,
+          drawn: 2.9,
+          gone: 5.1,
+        },
+        {
+          text: "fixed in the same turn",
+          row: ".repair",
+          anchor: "end",
+          place: "right",
+          at: 10.2,
+          drawn: 10.8,
+          gone: 99,
+        },
+      ];
+      const INK = { size: 46, sw: 4 };
+      const noteSvg = document.getElementById("note");
+      // The row's first text span, measured without the camera transform.
+      const rowBox = (sel) => {
+        const row = term.querySelector(sel + ".on");
+        if (!row) return null;
+        const r = document.createRange();
+        r.selectNodeContents(row);
+        const rects = [...r.getClientRects()];
+        if (rects.length === 0) return null;
+        const text = row.textContent;
+        const lead = text.length - text.trimStart().length;
+        const r2 = document.createRange();
+        r2.setStart(row.firstChild.nodeType === 3 ? row.firstChild : row, 0);
+        const b = row.getBoundingClientRect();
+        const cw = W ? 1180 / W : 9;
+        const end = b.left + 10 + text.trimEnd().length * cw;
+        return {
+          left: b.left + 10 + lead * cw,
+          right: end,
+          top: b.top,
+          bottom: b.bottom,
+          mid: b.top + b.height / 2,
+        };
+      };
+      const arrow = (from, to, bend) => {
+        const mx = (from.x + to.x) / 2 + bend.x,
+          my = (from.y + to.y) / 2 + bend.y;
+        const dx = to.x - mx,
+          dy = to.y - my,
+          len = Math.hypot(dx, dy) || 1;
+        const ux = dx / len,
+          uy = dy / len,
+          h = INK.size * 0.42;
+        const rot = (a) => [
+          Math.cos(a) * -ux - Math.sin(a) * -uy,
+          Math.sin(a) * -ux + Math.cos(a) * -uy,
+        ];
+        const [ax, ay] = rot(0.5),
+          [bx, by] = rot(-0.5);
+        return {
+          path: `M ${from.x} ${from.y} Q ${mx} ${my} ${to.x} ${to.y}`,
+          head: `M ${to.x + ax * h} ${to.y + ay * h} L ${to.x} ${to.y} L ${to.x + bx * h} ${to.y + by * h}`,
+        };
+      };
+      const note = (t) => {
+        const parts = [];
+        for (const n of NOTES) {
+          if (t < n.at || t > n.gone) continue;
+          const R = rowBox(n.row);
+          if (!R) continue;
+          const k = Math.min(1, (t - n.at) / (n.drawn - n.at));
+          const fade = n.gone < 90 && t > n.gone - 0.3 ? (n.gone - t) / 0.3 : 1;
+          const s = INK.size;
+          let tx, ty, a;
+          if (n.place === "above") {
+            // Text sits in the empty right side of the dimmed diff; the arrow comes
+            // down and left onto the first word of the block.
+            // Head lands on the middle of the first block row, just above it.
+            const to = { x: R.left + (R.right - R.left) * 0.45, y: R.top - s * 0.2 };
+            tx = 1200 * 0.62;
+            ty = R.top - s * 3.2;
+            const from = { x: tx - s * 0.3, y: ty + s * 0.15 };
+            a = arrow(from, to, { x: -s * 0.5, y: -s * 0.8 });
+          } else {
+            // Text on the blank row above the header, right side; arrow curls down
+            // onto the end of the header row.
+            // Text on the blank row above the header, right side; arrow curls down
+            // and left onto the middle of the header text.
+            tx = 1180 - s * 9.2;
+            ty = R.top - s * 0.55;
+            const to = { x: R.left + (R.right - R.left) * 0.55, y: R.top - s * 0.15 };
+            const from = { x: tx - s * 0.35, y: ty - s * 0.3 };
+            a = arrow(from, to, { x: -s * 0.3, y: -s * 0.9 });
+          }
+          const len = 900;
+          const draw = `stroke-dasharray:${len};stroke-dashoffset:${len * (1 - ease(k))}`;
+          const headOn = k >= 0.98 ? "" : "opacity:0";
+          const textOn = Math.max(0, Math.min(1, (t - (n.at + 0.25)) / 0.3));
+          parts.push(`
+    <g style="opacity:${fade}">
+      <text x="${tx}" y="${ty}" font-size="${s}" style="opacity:${textOn}">${n.text}</text>
+      <path d="${a.path}" stroke-width="${INK.sw}" style="${draw}"/>
+      <path d="${a.head}" stroke-width="${INK.sw}" style="${headOn}"/>
+    </g>`);
+        }
+        noteSvg.innerHTML = parts.join("");
+      };
+
+      window.seek = (t) => {
+        let last = null;
+        for (const d of term.querySelectorAll(".l")) {
+          const on = Number(d.dataset.t) <= t;
+          d.classList.toggle("on", on);
+          if (on) last = d;
+        }
+        const gap = last && last.textContent.trim() === "" ? "" : "\n";
+        live.innerHTML = gap + status(t) + "\n" + footer();
+        const dim = String(1 - 0.85 * spotlight(t));
+        for (const d of term.querySelectorAll(".l:not(.hook)")) d.style.opacity = dim;
+        live.style.opacity = dim;
+        document.querySelector(".titlebar").style.opacity = dim;
+        win.style.transform = "none";
+        scroll(t);
+        note(t);
+        camera(t);
+      };
+      window.duration = T.end;
+      window.ready = Promise.all([
+        document.fonts.load(`${FONT} 'SF Mono'`),
+        document.fonts.load(`bold ${FONT} 'SF Mono'`),
+        document.fonts.load("600 34px Caveat"),
+      ]).then(() => {
+        init();
+        seek(Number(new URLSearchParams(location.search).get("t") ?? T.end));
+      });
+    </script>
+  </body>
+</html>

@@ -1,0 +1,30 @@
+{
+  "name": "abide",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Enforce your own AGENTS.md rules on every edit a coding agent makes, from outside its context window.",
+  "license": "MIT",
+  "author": "Coldtea AI",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/coldteadotai/abide.git"
+  },
+  "type": "module",
+  "packageManager": "pnpm@10.5.2",
+  "engines": {
+    "node": ">=20.11"
+  },
+  "scripts": {
+    "build": "pnpm -r run build",
+    "typecheck": "pnpm -r run typecheck",
+    "test": "pnpm -r run test",
+    "verify": "pnpm run format:check && pnpm run build && pnpm run typecheck && pnpm run test",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "devDependencies": {
+    "prettier": "3",
+    "typescript": "7.0.2",
+    "vitest": "4.1.11"
+  }
+}
