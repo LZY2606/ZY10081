@@ -31,6 +31,8 @@ export const eventSchema = z.discriminatedUnion("kind", [
     phase: checkPhaseSchema,
     sessionId: z.string().optional(),
     promptId: z.string().optional(),
+    /** Which check-session event delivered this; same id retries land once. */
+    eventId: z.string().optional(),
     files: z.array(z.string()),
     rules: z.number().int(),
     /** Older logs counted regex rules here; abide no longer runs any. */
@@ -46,6 +48,7 @@ export const eventSchema = z.discriminatedUnion("kind", [
     at: z.string(),
     phase: checkPhaseSchema,
     sessionId: z.string().optional(),
+    eventId: z.string().optional(),
     reason: z.string(),
     files: z.array(z.string()).optional(),
   }),
@@ -54,6 +57,7 @@ export const eventSchema = z.discriminatedUnion("kind", [
     at: z.string(),
     phase: z.union([checkPhaseSchema, z.literal("session")]),
     sessionId: z.string().optional(),
+    eventId: z.string().optional(),
     code: z.string(),
     message: z.string(),
     latencyMs: z.number().optional(),
@@ -64,6 +68,18 @@ export const eventSchema = z.discriminatedUnion("kind", [
     sessionId: z.string().optional(),
     reason: z.string(),
     sources: z.array(z.string()),
+  }),
+  z.object({
+    kind: z.literal("session-conflict"),
+    at: z.string(),
+    sessionId: z.string(),
+    eventId: z.string().optional(),
+    phase: checkPhaseSchema,
+    what: z.enum(["rules", "files"]),
+    oldFingerprint: z.string(),
+    newFingerprint: z.string(),
+    files: z.array(z.string()),
+    affectedRules: z.array(z.string()),
   }),
 ]);
 export type AbideEvent = z.infer<typeof eventSchema>;

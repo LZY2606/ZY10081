@@ -16,12 +16,21 @@ import {
   STOP_GIT_TIMEOUT_MS,
   TURN_CHECK_TIMEOUT_MS,
 } from "../lib/constants.js";
+import {
+  awaitResult,
+  checkEventId,
+  claimEvent,
+  commitEvent,
+  markConflict,
+  openSession,
+  thresholdsOf,
+  verifyRules,
+} from "../lib/checkSession.js";
+import { loadSessionInput } from "../lib/checkSessionLoad.js";
 import { editsCoverFile } from "../lib/coverage.js";
 import { boundState, remainingMs, unifiedDiff } from "../lib/diff.js";
-import { appendEvent } from "../lib/events.js";
 import { blobIdsAt, diffTrees, snapshotTree, splitDiff, type FileDiff } from "../lib/git.js";
 import { hasApiKey } from "../lib/credentials.js";
-import { loadRules } from "../lib/loadRules.js";
 import { debug } from "../lib/output.js";
 import { findRepoRoot, isExcludedPath, relativeToRoot } from "../lib/paths.js";
 import { readRegularFile, readRegularText } from "../lib/regularFile.js";
@@ -132,6 +141,21 @@ export const turnDiff = (root: string, dir: string): TurnDiff => {
 
 type Pair = { rule: Rule; verdict: Verdict };
 
+const conflictNotice = (
+  what: "rules" | "files",
+  oldFingerprint: string,
+  newFingerprint: string,
+  affected: readonly string[],
+): string =>
+  [
+    `Abide: the rules or files this session started with changed underneath it (${what} drift), so the turn check was not committed to the audit.`,
+    `old rules ${oldFingerprint.slice(0, 10)} -> new ${newFingerprint.slice(0, 10)}.`,
+    affected.length > 0 ? `verdicts affected: ${affected.slice(0, 8).join(", ")}` : "",
+    'Run "abide session rebase" to adopt the current rules and continue this session.',
+  ]
+    .filter((line) => line !== "")
+    .join("\n");
+
 export const handleStop = async (raw: unknown): Promise<HookOutput> => {
   const parsed = stopInputSchema.safeParse(raw);
   if (!parsed.success) return { kind: "silent" };
@@ -147,46 +171,116 @@ export const handleStop = async (raw: unknown): Promise<HookOutput> => {
   };
 
   if (!hasTurnState(dir)) return finish({ kind: "silent" });
-  if (stopCheckCount(dir) >= MAX_STOP_CHECKS_PER_TURN) return finish({ kind: "silent" });
 
-  const loaded = loadRules(root);
-  for (const problem of loaded.problems) debug(problem);
-  if (loaded.rules.length === 0) return finish({ kind: "silent" });
+  const snapshot = openSession(input.session_id, root, () =>
+    loadSessionInput(root, { sessionId: input.session_id, turnId: turnIdOf(input) }),
+  );
+  if (snapshot === undefined || snapshot.rules.length === 0) return finish({ kind: "silent" });
+  const rules = snapshot.rules;
+  const thresholds = thresholdsOf(snapshot);
+
+  // Delivery number is read before this delivery increments it: the first
+  // Stop of a turn is 0, the repair-round Stop is 1. Retrying either delivery
+  // keeps its number and therefore its event id and lands exactly once.
+  const deliveryNo = stopCheckCount(dir);
+  if (deliveryNo >= MAX_STOP_CHECKS_PER_TURN) return finish({ kind: "silent" });
+
+  const eventId = checkEventId(
+    input.session_id,
+    "turn",
+    turnIdOf(input),
+    undefined,
+    [],
+    deliveryNo,
+  );
+  const claim = claimEvent(input.session_id, { eventId, phase: "turn", files: [] });
+  if (claim.status === "duplicate") {
+    const result =
+      claim.result ?? (await awaitResult(input.session_id, eventId, TURN_CHECK_TIMEOUT_MS));
+    return finish(result?.output ?? { kind: "silent" });
+  }
 
   const turn = turnDiff(root, dir);
   if (turn.kind === "incomplete") {
-    appendEvent(root, {
-      kind: "skip",
-      at,
-      phase: "turn",
-      sessionId: input.session_id,
-      reason: `turn diff incomplete: ${turn.reason}`,
-      files: turn.missing,
-    });
+    commitEvent(
+      root,
+      input.session_id,
+      eventId,
+      {
+        kind: "skip",
+        at,
+        phase: "turn",
+        sessionId: input.session_id,
+        eventId,
+        reason: `turn diff incomplete: ${turn.reason}`,
+        files: turn.missing,
+      },
+      { kind: "silent" },
+    );
     return finish({ kind: "silent" });
   }
-  const { files, fileDiffs } = turn;
+  const { files } = turn;
   if (files.length === 0) return finish({ kind: "silent" });
-  const bounded = fileDiffs.map((f) => ({
+  const bounded = turn.fileDiffs.map((f) => ({
     file: f.file,
     text: boundState(f.text, 8_000).text,
   }));
 
-  if (!hasApiKey(root)) {
-    appendEvent(root, {
-      kind: "skip",
-      at,
-      phase: "turn",
-      sessionId: input.session_id,
-      reason: "no api key",
-      files,
-    });
+  incrementStopChecks(dir);
+
+  // A turn check reads its change from the turn-start baseline, so shell-made
+  // edits are part of it by design; only the rules are frozen here. File
+  // coherence for delivered edits is settled separately by the coverage chain.
+  const checked = readChecked(dir);
+  const drift = verifyRules(snapshot, root, files);
+  if (drift.kind !== "clean") {
+    markConflict(snapshot, drift, files);
+    const systemMessage = conflictNotice(
+      drift.kind,
+      drift.oldFingerprint,
+      drift.newFingerprint,
+      drift.affectedRules,
+    );
+    commitEvent(
+      root,
+      input.session_id,
+      eventId,
+      {
+        kind: "session-conflict",
+        at,
+        sessionId: input.session_id,
+        eventId,
+        phase: "turn",
+        what: drift.kind,
+        oldFingerprint: drift.oldFingerprint,
+        newFingerprint: drift.newFingerprint,
+        files: drift.kind === "files" ? drift.changed : files,
+        affectedRules: drift.affectedRules,
+      },
+      { kind: "notice", systemMessage },
+    );
+    return finish({ kind: "notice", systemMessage });
   }
 
-  incrementStopChecks(dir);
-  // Edit-phase rules rerun on files the edit checks did not see whole, and on
-  // blocked ones: a block the agent ignored must not end the turn quietly.
-  const checked = readChecked(dir);
+  if (!hasApiKey(root)) {
+    const committed = commitEvent(
+      root,
+      input.session_id,
+      eventId,
+      {
+        kind: "skip",
+        at,
+        phase: "turn",
+        sessionId: input.session_id,
+        eventId,
+        reason: "no api key",
+        files,
+      },
+      { kind: "silent" },
+    );
+    return finish(committed?.output ?? { kind: "silent" });
+  }
+
   const blocked = readBlockedFiles(dir);
   const covered = (file: string): boolean => {
     if (turn.startIds === undefined || blocked.has(file)) return false;
@@ -207,8 +301,8 @@ export const handleStop = async (raw: unknown): Promise<HookOutput> => {
       phase: "turn",
       fileDiffs: bounded,
       task,
-      rules: loaded.rules,
-      thresholds: loaded.thresholds,
+      rules,
+      thresholds,
       timeoutMs: TURN_CHECK_TIMEOUT_MS,
     });
     const editOutcomes = await Promise.all(
@@ -217,27 +311,34 @@ export const handleStop = async (raw: unknown): Promise<HookOutput> => {
           phase: "edit",
           fileDiffs: [f],
           task,
-          rules: loaded.rules,
-          thresholds: loaded.thresholds,
+          rules,
+          thresholds,
           timeoutMs: TURN_CHECK_TIMEOUT_MS,
         }),
       ),
     );
     outcome = mergeOutcomes([turnOutcome, ...editOutcomes]);
   } catch (error) {
-    appendEvent(root, {
-      kind: "error",
-      at,
-      phase: "turn",
-      sessionId: input.session_id,
-      code: isAbideError(error) ? error.code : "CHECK_FAILED",
-      message: error instanceof Error ? error.message : String(error),
-      latencyMs: Math.round(performance.now() - started),
-    });
+    commitEvent(
+      root,
+      input.session_id,
+      eventId,
+      {
+        kind: "error",
+        at,
+        phase: "turn",
+        sessionId: input.session_id,
+        eventId,
+        code: isAbideError(error) ? error.code : "CHECK_FAILED",
+        message: error instanceof Error ? error.message : String(error),
+        latencyMs: Math.round(performance.now() - started),
+      },
+      { kind: "silent" },
+    );
     return finish({ kind: "silent" });
   }
 
-  const byId = new Map(loaded.rules.map((r) => [r.id, r]));
+  const byId = new Map(rules.map((r) => [r.id, r]));
   const pairs = (band: Verdict["band"]): Pair[] =>
     outcome.verdicts.flatMap((verdict) => {
       const rule = byId.get(verdict.ruleId);
@@ -246,30 +347,39 @@ export const handleStop = async (raw: unknown): Promise<HookOutput> => {
   const acting = pairs("act");
   const flagged = pairs("flag");
 
-  appendEvent(root, {
-    kind: "check",
-    at,
-    phase: "turn",
-    sessionId: input.session_id,
-    promptId: turnIdOf(input),
-    files,
-    rules: outcome.modelRules.length,
-    latencyMs: Math.round(performance.now() - started),
-    modelLatencyMs: outcome.modelLatencyMs,
-    usage: outcome.usage,
-    verdicts: outcome.verdicts,
-    blocked: acting.length > 0,
-  });
-
   const systemMessage = flagged.length > 0 ? flagNotice("turn", flagged, files) : undefined;
-  if (acting.length > 0) {
-    return finish({
-      kind: "block",
-      reason: repairReason("turn", acting, files),
-      ...(systemMessage === undefined ? {} : { systemMessage }),
-    });
-  }
-  return finish(
-    systemMessage === undefined ? { kind: "silent" } : { kind: "notice", systemMessage },
+  const output: HookOutput =
+    acting.length > 0
+      ? {
+          kind: "block",
+          reason: repairReason("turn", acting, files),
+          ...(systemMessage === undefined ? {} : { systemMessage }),
+        }
+      : systemMessage === undefined
+        ? { kind: "silent" }
+        : { kind: "notice", systemMessage };
+
+  const committed = commitEvent(
+    root,
+    input.session_id,
+    eventId,
+    {
+      kind: "check",
+      at,
+      phase: "turn",
+      sessionId: input.session_id,
+      eventId,
+      promptId: turnIdOf(input),
+      files,
+      rules: outcome.modelRules.length,
+      latencyMs: Math.round(performance.now() - started),
+      modelLatencyMs: outcome.modelLatencyMs,
+      usage: outcome.usage,
+      verdicts: outcome.verdicts,
+      blocked: acting.length > 0,
+    },
+    output,
   );
+  if (committed === undefined) debug(`stop: could not commit event ${eventId}`);
+  return finish(output);
 };

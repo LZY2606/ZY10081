@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 
 const script = path.resolve(
@@ -21,14 +22,24 @@ const run = (name: string, input: string) =>
     timeout: 25_000,
   });
 
-const rubricWith = (rules: unknown[]): string =>
-  JSON.stringify({ version: 1, compiledAt: "x", sources: [{ path: "AGENTS.md" }], rules });
+const sourceSha = (root: string): string =>
+  createHash("sha256")
+    .update(readFileSync(path.join(root, "AGENTS.md")))
+    .digest("hex");
+
+const rubricWith = (rules: unknown[], root?: string): string =>
+  JSON.stringify({
+    version: 1,
+    compiledAt: "x",
+    sources: [{ path: "AGENTS.md", ...(root ? { sha: sourceSha(root) } : {}) }],
+    rules,
+  });
 
 const repoWith = (rules: unknown[]): string => {
   const root = mkdtempSync(path.join(tmpdir(), "abide-repo-"));
   writeFileSync(path.join(root, "AGENTS.md"), "- rule\n");
   mkdirSync(path.join(root, ".abide"));
-  writeFileSync(path.join(root, ".abide", "rubric.json"), rubricWith(rules));
+  writeFileSync(path.join(root, ".abide", "rubric.json"), rubricWith(rules, root));
   return root;
 };
 
@@ -107,7 +118,7 @@ describe("the hook never breaks the agent (needs `pnpm build` first)", () => {
       "git init -q . && git add -A && git -c user.email=a@b -c user.name=a commit -q -m init",
       { cwd: root },
     );
-    const base = { session_id: "t", prompt_id: "p", cwd: root };
+    const base = { session_id: "shell-add", prompt_id: "p", cwd: root };
     const start = run(
       "turn-start",
       JSON.stringify({ ...base, hook_event_name: "UserPromptSubmit", prompt: "go" }),
@@ -141,7 +152,7 @@ describe("the hook never breaks the agent (needs `pnpm build` first)", () => {
       "git init -q . && git add -A && git -c user.email=a@b -c user.name=a commit -q -m init",
       { cwd: root },
     );
-    const base = { session_id: "t", prompt_id: "p", cwd: root };
+    const base = { session_id: "shell-del", prompt_id: "p", cwd: root };
     run(
       "turn-start",
       JSON.stringify({ ...base, hook_event_name: "UserPromptSubmit", prompt: "go" }),
@@ -314,5 +325,160 @@ describe("the hook never breaks the agent (needs `pnpm build` first)", () => {
     expect(out.hookSpecificOutput.additionalContext).toContain("compile-skill.md");
     expect(out.hookSpecificOutput.additionalContext).toContain("AGENTS.md");
     expect(out.systemMessage).toContain("no API key");
+  });
+});
+
+const editRule = {
+  id: "say-why",
+  text: "say why",
+  source: { path: "AGENTS.md" },
+  when: "edit",
+  check: { type: "model", question: { type: "boolean", instructions: "?" } },
+} as const;
+
+const sessionRepo = (rule: unknown = editRule): { root: string; home: string } => {
+  const root = mkdtempSync(path.join(tmpdir(), "abide-repo-"));
+  const home = mkdtempSync(path.join(tmpdir(), "abide-home-"));
+  writeFileSync(path.join(root, "AGENTS.md"), "- say why\n");
+  mkdirSync(path.join(root, ".abide"));
+  writeFileSync(path.join(root, ".abide", "rubric.json"), rubricWith([rule], root));
+  return { root, home };
+};
+
+const runIn = (home: string, name: string, input: unknown) =>
+  spawnSync("node", [script, name], {
+    input: JSON.stringify(input),
+    encoding: "utf8",
+    env: { ...process.env, AI_GATEWAY_API_KEY: "", TYPESAFE_AI_API_KEY: "", ABIDE_HOME_DIR: home },
+    timeout: 25_000,
+  });
+
+const readEventsIn = (root: string) =>
+  readFileSync(path.join(root, ".abide", "events.jsonl"), "utf8")
+    .trim()
+    .split("\n")
+    .filter((l) => l.trim() !== "")
+    .map((l) => JSON.parse(l));
+
+const editContent = "export const why = 1;\n";
+
+const editPayload = (root: string, sessionId: string, file = "a.ts", toolId = "tool-1") => {
+  // The host applies the write before PostToolUse fires, so the file is on disk.
+  writeFileSync(path.join(root, file), editContent);
+  return {
+    session_id: sessionId,
+    prompt_id: "p",
+    cwd: root,
+    hook_event_name: "PostToolUse",
+    tool_name: "Write",
+    tool_use_id: toolId,
+    tool_input: { file_path: path.join(root, file), content: editContent },
+    tool_response: { originalFile: null, structuredPatch: [] },
+  };
+};
+
+describe("immutable check session (needs `pnpm build` first)", () => {
+  it("a rule file changed mid-session withholds the verdict as a rules conflict naming both fingerprints", () => {
+    const { root, home } = sessionRepo();
+    const sessionId = "mid-rules";
+    // First edit establishes the snapshot against the original rules.
+    runIn(home, "post-tool-use", editPayload(root, sessionId, "a.ts", "tool-1"));
+    // The instruction file changes before the next delivery.
+    writeFileSync(path.join(root, "AGENTS.md"), "- never use the letter e\n");
+    const r = runIn(home, "post-tool-use", editPayload(root, sessionId, "b.ts", "tool-2"));
+    expect(r.status).toBe(0);
+    const events = readEventsIn(root);
+    const conflict = events.filter((e) => e.kind === "session-conflict");
+    expect(conflict).toHaveLength(1);
+    expect(conflict[0].what).toBe("rules");
+    expect(conflict[0].oldFingerprint).toMatch(/^[0-9a-f]{64}$/);
+    expect(conflict[0].newFingerprint).not.toBe(conflict[0].oldFingerprint);
+    expect(conflict[0].affectedRules).toContain("say-why");
+    expect(JSON.stringify(r.stdout)).toContain("rebase");
+  });
+
+  it("an external change to a covered file is reported as a files conflict, not checked against it", () => {
+    const { root, home } = sessionRepo();
+    const sessionId = "ext-drift";
+    runIn(home, "post-tool-use", editPayload(root, sessionId, "a.ts", "tool-1"));
+    // The second delivery reports the same on-disk content the host just wrote.
+    const second = editPayload(root, sessionId, "a.ts", "tool-2");
+    // Then something outside the hooks rewrites that file before the check commits.
+    writeFileSync(path.join(root, "a.ts"), "export const tampered = true;\n");
+    const r = runIn(home, "post-tool-use", second);
+    expect(r.status).toBe(0);
+    const events = readEventsIn(root);
+    const conflict = events.filter((e) => e.kind === "session-conflict");
+    expect(conflict.map((c) => c.what)).toContain("files");
+    expect(conflict.flatMap((c) => c.files)).toContain("a.ts");
+  });
+
+  it("a retried hook with the same session and event id commits one event and one verdict set", () => {
+    const { root, home } = sessionRepo();
+    const sessionId = "dup-hook";
+    const payload = editPayload(root, sessionId, "a.ts", "same-tool");
+    runIn(home, "post-tool-use", payload);
+    runIn(home, "post-tool-use", payload);
+    const events = readEventsIn(root);
+    const ids = events.map((e) => e.eventId).filter((id) => id !== undefined);
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(events.filter((e) => e.kind === "skip" && e.eventId !== undefined)).toHaveLength(1);
+  });
+
+  it("commits a verdict after a restart with no half audit", () => {
+    const { root, home } = sessionRepo();
+    const sessionId = "restart-commit";
+    runIn(home, "post-tool-use", editPayload(root, sessionId, "a.ts", "tool-1"));
+    const eventsBefore = readEventsIn(root).length;
+    // A second, distinct delivery after "restart": still one event per id.
+    runIn(home, "post-tool-use", editPayload(root, sessionId, "b.ts", "tool-2"));
+    const events = readEventsIn(root);
+    expect(events.length).toBe(eventsBefore + 1);
+    const everyLineHasId = events.every((e) => typeof e.eventId === "string");
+    expect(everyLineHasId).toBe(true);
+    // The snapshot survived: it is the same rule version across the restart.
+    const snapshot = JSON.parse(
+      readFileSync(
+        path.join(home, ".abide", "sessions", sessionId, ".session", "snapshot.json"),
+        "utf8",
+      ),
+    );
+    expect(snapshot.rules.map((rule: { id: string }) => rule.id)).toEqual(["say-why"]);
+  });
+
+  it("deliveries from different host tools in either order leave one verdict per delivery", () => {
+    const { root, home } = sessionRepo();
+    const sessionId = "host-order";
+    const first = editPayload(root, sessionId, "a.ts", "host-tool-a");
+    const second = editPayload(root, sessionId, "b.ts", "host-tool-b");
+    runIn(home, "post-tool-use", second);
+    runIn(home, "post-tool-use", first);
+    const events = readEventsIn(root).filter((e) => e.kind === "skip");
+    const files = events.flatMap((e) => e.files ?? []).sort();
+    expect(files).toEqual(["a.ts", "b.ts"]);
+  });
+
+  it("two adapters delivering the same event at once leave one audit line", async () => {
+    const { spawn } = await import("node:child_process");
+    const { root, home } = sessionRepo();
+    const sessionId = "concurrent-adapters";
+    const payload = editPayload(root, sessionId, "a.ts", "same-delivery");
+    const deliver = () =>
+      new Promise<void>((resolve) => {
+        const child = spawn("node", [script, "post-tool-use"], {
+          env: {
+            ...process.env,
+            AI_GATEWAY_API_KEY: "",
+            TYPESAFE_AI_API_KEY: "",
+            ABIDE_HOME_DIR: home,
+          },
+        });
+        child.on("close", () => resolve());
+        child.stdin.end(JSON.stringify(payload));
+      });
+    await Promise.all([deliver(), deliver()]);
+    const events = readEventsIn(root);
+    const forDelivery = events.filter((e) => e.files?.includes("a.ts"));
+    expect(forDelivery).toHaveLength(1);
   });
 });

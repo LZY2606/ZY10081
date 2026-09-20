@@ -6,7 +6,9 @@ import { EDIT_CHECK_TIMEOUT_MS, TURN_CHECK_TIMEOUT_MS } from "../lib/constants.j
 import { hasApiKey, NO_KEY_HINT } from "../lib/credentials.js";
 import { boundState } from "../lib/diff.js";
 import { splitDiff, workingTreeDiff } from "../lib/git.js";
-import { loadRules } from "../lib/loadRules.js";
+import { ephemeralSession, thresholdsOf } from "../lib/checkSession.js";
+import { readRubric } from "../lib/rubricFile.js";
+import { globalRubricPath, rubricPath } from "../lib/paths.js";
 import { findRepoRoot } from "../lib/paths.js";
 import { say } from "../lib/ui.js";
 import { Header } from "../ui/components/Header.js";
@@ -27,12 +29,17 @@ export const runCheckCommand = async (argv: string[]): Promise<number> => {
     },
   });
   const root = findRepoRoot(process.cwd());
-  const loaded = loadRules(root);
-  if (loaded.rules.length === 0)
+  const projectRead = readRubric(rubricPath(root));
+  const globalRead = readRubric(globalRubricPath());
+  const project = projectRead.kind === "ok" ? projectRead.rubric : undefined;
+  const global = globalRead.kind === "ok" ? globalRead.rubric : undefined;
+  const session = ephemeralSession(root, project, global);
+  if (session.rules.length === 0)
     throw new AbideError(
       "RUBRIC_MISSING",
       "no rubric here or in ~/.abide; run abide compile first",
     );
+  const loaded = { rules: session.rules, thresholds: thresholdsOf(session) };
 
   if (!hasApiKey(root)) throw new AbideError("NO_API_KEY", NO_KEY_HINT);
 
@@ -46,7 +53,15 @@ export const runCheckCommand = async (argv: string[]): Promise<number> => {
   const run = async (progress: (label: string) => void): Promise<CheckData> => {
     const sections: CheckSection[] = [];
     let spendUsd = 0;
-    if (files.length === 0) return { root, sections, spendUsd, all: values.all };
+    if (files.length === 0)
+      return {
+        root,
+        sections,
+        spendUsd,
+        all: values.all,
+        ruleFingerprint: session.ruleFingerprint,
+        ruleCount: session.rules.length,
+      };
     if (phase === "all" || phase === "edit") {
       for (const f of files) {
         progress(`checking ${f.file}`);
@@ -93,7 +108,14 @@ export const runCheckCommand = async (argv: string[]): Promise<number> => {
         verdicts: out.verdicts,
       });
     }
-    return { root, sections, spendUsd, all: values.all };
+    return {
+      root,
+      sections,
+      spendUsd,
+      all: values.all,
+      ruleFingerprint: session.ruleFingerprint,
+      ruleCount: session.rules.length,
+    };
   };
 
   if (values.json) {

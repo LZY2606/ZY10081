@@ -9,6 +9,24 @@ import { Section } from "../components/Section.js";
 import { median, ms, usd } from "../../lib/ui.js";
 import { glyph, palette } from "../theme.js";
 
+export type SessionSummary = {
+  sessionId: string;
+  ruleFingerprint: string;
+  ruleCount: number;
+  scope: string[];
+  covered: string[];
+  base: string;
+  checks: number;
+  conflicts: number;
+  rebased: boolean;
+  conflict: {
+    what: "rules" | "files";
+    oldFingerprint: string;
+    newFingerprint: string;
+    affectedRules: string[];
+  } | null;
+};
+
 export type ReportData = {
   root: string;
   rules: Rule[];
@@ -16,6 +34,7 @@ export type ReportData = {
   stats: Map<string, RuleStats>;
   dead: Rule[];
   problems: string[];
+  sessions: SessionSummary[];
 };
 
 type Check = Extract<AbideEvent, { kind: "check" }>;
@@ -166,6 +185,49 @@ export function ReportView({ data }: { data: ReportData }) {
               </Text>
             </Box>
           ) : null}
+        </Section>
+      ) : null}
+
+      {data.sessions.length > 0 ? (
+        <Section
+          title="Check sessions"
+          aside={`${data.sessions.length} ${data.sessions.length === 1 ? "snapshot" : "snapshots"}`}
+        >
+          {data.sessions.slice(0, 6).map((session) => (
+            <Box key={session.sessionId} flexDirection="column" marginBottom={1}>
+              <Box>
+                <Text color={session.conflict ? palette.rose : palette.mist}>
+                  {session.sessionId.slice(0, 16)}
+                </Text>
+                <Text color={palette.ash}>
+                  {"  "}
+                  rules {session.ruleFingerprint.slice(0, 10)} ({session.ruleCount}) {glyph.dotSep}{" "}
+                  base {session.base} {glyph.dotSep} {session.checks}{" "}
+                  {session.checks === 1 ? "check" : "checks"}
+                  {session.rebased ? ` ${glyph.dotSep} rebased` : ""}
+                </Text>
+              </Box>
+              <Text color={palette.ash} wrap="truncate-end">
+                covers{" "}
+                {session.covered.length === 0
+                  ? "no files yet"
+                  : session.covered.slice(0, 8).join(", ")}
+                {session.covered.length > 8 ? ` +${session.covered.length - 8}` : ""}
+              </Text>
+              {session.conflict ? (
+                <Text color={palette.rose} wrap="wrap">
+                  {glyph.cross} {session.conflict.what} drift{" "}
+                  {session.conflict.oldFingerprint.slice(0, 8)}
+                  {" -> "}
+                  {session.conflict.newFingerprint.slice(0, 8)}
+                  {session.conflict.affectedRules.length > 0
+                    ? ` ${glyph.dotSep} affects ${session.conflict.affectedRules.slice(0, 4).join(", ")}`
+                    : ""}{" "}
+                  {glyph.dotSep} run abide session rebase
+                </Text>
+              ) : null}
+            </Box>
+          ))}
         </Section>
       ) : null}
 

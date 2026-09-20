@@ -15,14 +15,29 @@ export type CheckSection = {
   verdicts: Verdict[];
 };
 
-export type CheckData = { root: string; sections: CheckSection[]; spendUsd: number; all: boolean };
+export type CheckData = {
+  root: string;
+  sections: CheckSection[];
+  spendUsd: number;
+  all: boolean;
+  ruleFingerprint?: string;
+  ruleCount?: number;
+};
 
 export function CheckView({ data }: { data: CheckData }) {
   const acts = data.sections.flatMap((s) => s.verdicts).filter((v) => v.band === "act").length;
   const flags = data.sections.flatMap((s) => s.verdicts).filter((v) => v.band === "flag").length;
   return (
     <Box flexDirection="column">
-      <Header command="check" where={data.root} />
+      <Header
+        command="check"
+        where={data.root}
+        note={
+          data.ruleFingerprint === undefined
+            ? undefined
+            : `short session ${glyph.dotSep} rules ${data.ruleFingerprint.slice(0, 10)} (${data.ruleCount})`
+        }
+      />
       {data.sections.map((s, i) => (
         <Section
           key={i}

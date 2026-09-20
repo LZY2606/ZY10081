@@ -35,9 +35,14 @@ const hunksBetween = (
 };
 
 const allAdded = (content: string): string => {
+  // Keep the terminal empty segment: a file ending in a newline has one, and
+  // the synthesized content must byte-match the disk for blob comparison.
   const lines = content.split("\n");
-  if (lines.at(-1) === "") lines.pop();
-  return `@@ -0,0 +1,${lines.length} @@\n${lines.map((l) => `+${l}`).join("\n")}`;
+  const count = lines.length - (lines.at(-1) === "" ? 1 : 0);
+  return `@@ -0,0 +1,${count} @@\n${lines
+    .slice(0, count)
+    .map((l) => `+${l}`)
+    .join("\n")}`;
 };
 
 /**

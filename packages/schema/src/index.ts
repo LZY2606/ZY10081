@@ -61,6 +61,19 @@ export {
 } from "./hooks.js";
 export { hostSchema, HOSTS, type Host } from "./host.js";
 export {
+  SESSION_SNAPSHOT_VERSION,
+  checkSessionSnapshotSchema,
+  snapshotOriginSchema,
+  knownFileSchema,
+  sessionEventRecordSchema,
+  ruleFingerprintOf,
+  type CheckSessionSnapshot,
+  type SnapshotOrigin,
+  type SnapshotRule,
+  type KnownFile,
+  type SessionEventRecord,
+} from "./session.js";
+export {
   bandSchema,
   verdictSchema,
   checkPhaseSchema,

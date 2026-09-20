@@ -3,7 +3,9 @@ import { AbideError } from "@coldtea/abide-schema";
 import { auditFiles, auditableFiles, listRepoFiles, tallyByRule } from "../lib/audit.js";
 import { isGitRepo } from "../lib/git.js";
 import { hasApiKey, NO_KEY_HINT } from "../lib/credentials.js";
-import { loadRules } from "../lib/loadRules.js";
+import { ephemeralSession, thresholdsOf } from "../lib/checkSession.js";
+import { readRubric } from "../lib/rubricFile.js";
+import { globalRubricPath, rubricPath } from "../lib/paths.js";
 import { findRepoRoot } from "../lib/paths.js";
 import { say, usd } from "../lib/ui.js";
 import { Header } from "../ui/components/Header.js";
@@ -29,7 +31,14 @@ export const runAudit = async (argv: string[]): Promise<number> => {
       "GIT_UNAVAILABLE",
       "audit walks the files git knows about, and this is not a git repository",
     );
-  const loaded = loadRules(root);
+  const projectRead = readRubric(rubricPath(root));
+  const globalRead = readRubric(globalRubricPath());
+  const session = ephemeralSession(
+    root,
+    projectRead.kind === "ok" ? projectRead.rubric : undefined,
+    globalRead.kind === "ok" ? globalRead.rubric : undefined,
+  );
+  const loaded = { rules: session.rules, thresholds: thresholdsOf(session) };
   if (loaded.rules.length === 0)
     throw new AbideError(
       "RUBRIC_MISSING",

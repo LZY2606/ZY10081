@@ -1,12 +1,14 @@
 import { parseArgs } from "node:util";
-import type { AbideEvent, Rule } from "@coldtea/abide-schema";
+import type { AbideEvent, CheckSessionSnapshot, Rule } from "@coldtea/abide-schema";
 import { readEvents } from "../lib/events.js";
 import { loadRules } from "../lib/loadRules.js";
+import { coveredFiles, listSessions } from "../lib/checkSession.js";
+import { repoKeyOf } from "../lib/checkSession.js";
 import { findRepoRoot } from "../lib/paths.js";
 import { say } from "../lib/ui.js";
 import type { RuleStats } from "../ui/components/RuleTable.js";
 import { showStatic } from "../ui/render.js";
-import { ReportView, type ReportData } from "../ui/views/ReportView.js";
+import { ReportView, type ReportData, type SessionSummary } from "../ui/views/ReportView.js";
 import { InitView } from "../ui/views/InitView.js";
 
 const statsFrom = (events: readonly AbideEvent[]): Map<string, RuleStats> => {
@@ -25,6 +27,41 @@ const statsFrom = (events: readonly AbideEvent[]): Map<string, RuleStats> => {
 };
 
 const MIN_CHECKS_TO_CALL_DEAD = 20;
+
+const summarizeSessions = (root: string): SessionSummary[] => {
+  const key = repoKeyOf(root);
+  const events = readEvents(root);
+  return listSessions()
+    .filter((s) => s.repoKey === key)
+    .map((snapshot: CheckSessionSnapshot): SessionSummary => {
+      const sessionEvents = events.filter((e) => e.sessionId === snapshot.sessionId);
+      const checks = sessionEvents.filter((e) => e.kind === "check").length;
+      const conflicts = sessionEvents.filter((e) => e.kind === "session-conflict").length;
+      return {
+        sessionId: snapshot.sessionId,
+        ruleFingerprint: snapshot.ruleFingerprint,
+        ruleCount: snapshot.rules.length,
+        scope: snapshot.allowedScope,
+        covered: coveredFiles(snapshot),
+        base:
+          snapshot.base.kind === "git" && snapshot.base.head
+            ? snapshot.base.head.slice(0, 7)
+            : "files",
+        conflict:
+          snapshot.conflict === undefined
+            ? null
+            : {
+                what: snapshot.conflict.kind,
+                oldFingerprint: snapshot.conflict.oldFingerprint,
+                newFingerprint: snapshot.conflict.newFingerprint,
+                affectedRules: snapshot.conflict.affectedRules,
+              },
+        checks,
+        conflicts,
+        rebased: snapshot.rebasedFrom !== undefined,
+      };
+    });
+};
 
 export const collectReport = (root: string): ReportData | undefined => {
   const loaded = loadRules(root);
@@ -47,7 +84,15 @@ export const collectReport = (root: string): ReportData | undefined => {
       s.flagged === 0
     );
   });
-  return { root, rules: loaded.rules, events, stats, dead, problems: loaded.problems };
+  return {
+    root,
+    rules: loaded.rules,
+    events,
+    stats,
+    dead,
+    problems: loaded.problems,
+    sessions: summarizeSessions(root),
+  };
 };
 
 /** Rules, calibration, and what has fired so far in this repository. */
@@ -69,11 +114,12 @@ export const runReport = async (argv: string[]): Promise<number> => {
   if (values.json) {
     say(
       JSON.stringify({
-        root: data.root,
+        root,
         rules: data.rules,
         stats: Object.fromEntries(data.stats),
         dead: data.dead.map((r) => r.id),
         events: data.events.length,
+        sessions: data.sessions,
       }),
     );
     return 0;

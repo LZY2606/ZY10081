@@ -10,7 +10,9 @@ export type AbideErrorCode =
   | "GIT_UNAVAILABLE"
   | "CLAUDE_UNAVAILABLE"
   | "CHECK_TIMEOUT"
-  | "CHECK_FAILED";
+  | "CHECK_FAILED"
+  | "SESSION_CONFLICT"
+  | "SESSION_NOT_FOUND";
 
 export class AbideError extends Error {
   readonly code: AbideErrorCode;

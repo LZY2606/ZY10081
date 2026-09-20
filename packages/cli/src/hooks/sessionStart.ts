@@ -6,6 +6,8 @@ import { findLintConfigs } from "../lib/lintConfig.js";
 import { placeCompileSkill } from "../lib/packageRoot.js";
 import { findRepoRoot, globalRubricPath, homeDir, rubricPath } from "../lib/paths.js";
 import { readRubric } from "../lib/rubricFile.js";
+import { openSession } from "../lib/checkSession.js";
+import { loadSessionInput } from "../lib/checkSessionLoad.js";
 import { pruneOldTurns } from "../lib/session.js";
 import { checkStaleness, discoverGlobalSources, discoverProjectSources } from "../lib/sources.js";
 
@@ -67,6 +69,11 @@ export const handleSessionStart = async (raw: unknown): Promise<HookOutput> => {
   const input = parsed.data;
   const root = findRepoRoot(input.cwd);
   pruneOldTurns();
+
+  // Record the immutable view this session checks against, before any edit.
+  // A fresh-rubric session snapshots here; one needing a compile snapshots on
+  // its first check after the rubric exists.
+  openSession(input.session_id, root, () => loadSessionInput(root, { timeoutMs: 5_000 }));
 
   const plan = planCompile(root);
   const notices: string[] = [];

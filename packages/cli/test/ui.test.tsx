@@ -100,7 +100,15 @@ describe("views", () => {
   it("report names the dead rules out loud", () => {
     const { lastFrame } = render(
       <ReportView
-        data={{ root: "/r", rules, events: [], stats: new Map(), dead: [], problems: [] }}
+        data={{
+          root: "/r",
+          rules,
+          events: [],
+          stats: new Map(),
+          dead: [],
+          problems: [],
+          sessions: [],
+        }}
       />,
     );
     const frame = lastFrame() ?? "";

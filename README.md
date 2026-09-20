@@ -99,6 +99,7 @@ Every file is judged as if it had just been written. You get a table by rule and
 | `abide audit [paths]`     | judge existing files, report by rule and by file                      |
 | `abide check [paths]`     | check uncommitted changes the way the hooks would                     |
 | `abide report`            | your rules, what fired, what never fires                              |
+| `abide session [rebase]`  | show check sessions, or adopt the current rules after a drift         |
 | `abide replay <agent>`    | judge this repo's past sessions in any of the three agents            |
 | `abide compile`           | compile the rubric now instead of at the next session                 |
 | `abide calibrate`         | score every rule against your recent git history                      |
@@ -118,6 +119,16 @@ Every file is judged as if it had just been written. You get a table by rule and
 - A badly worded rule scores 0.4 on everything and never fires. `calibrate` finds those against twenty real hunks from your history and switches them off. `tune` has the agent rewrite them.
 
 ![abide report](docs/images/report.svg)
+
+## One rule view for the whole session
+
+A long turn touches many files in one go. Abide does not want the first file checked against one version of your rules and the last against another. When a session starts it takes one immutable snapshot: the instruction files, a fingerprint of the compiled rules, the base commit, the scope in play, and the file versions then in view. Every hook in that session checks against that snapshot; hooks append their diffs and evidence, but none silently re-reads the rules.
+
+Before a verdict is committed, Abide checks the snapshot still matches the tree. If an instruction file, the rubric, or a covered file changed underneath the session, the verdict is withheld and a conflict is recorded with the old fingerprint, the new fingerprint and the rules affected. `abide report` shows the rule version, covered files and conflict state; `abide session rebase` starts a fresh view on the rules as they are now and archives the old snapshot.
+
+A hook can be retried, and more than one adapter can deliver the same event. A delivery is keyed by session and event id, so the same id produces exactly one event and one verdict set even when two processes race. A process that dies before committing leaves no half audit: the next delivery takes the event over and the one verdict lands once. Snapshots serialize to disk and survive a restart. They never contain credentials, your home path, or file contents — only hashes, repo-relative paths and the verdicts committed.
+
+`abide check` on a one-off diff stays a single command: it runs inside a short, in-memory session and is not written to the audit.
 
 ## Cost, privacy, safety
 
