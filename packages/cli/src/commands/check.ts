@@ -1,7 +1,9 @@
 import { readFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 import { AbideError } from "@coldtea/abide-schema";
+import { randomUUID } from "node:crypto";
 import { runCheck } from "../lib/checkRunner.js";
+import { ensureSession, removeSession } from "../lib/checkSession.js";
 import { EDIT_CHECK_TIMEOUT_MS, TURN_CHECK_TIMEOUT_MS } from "../lib/constants.js";
 import { hasApiKey, NO_KEY_HINT } from "../lib/credentials.js";
 import { boundState } from "../lib/diff.js";
@@ -36,6 +38,23 @@ export const runCheckCommand = async (argv: string[]): Promise<number> => {
 
   if (!hasApiKey(root)) throw new AbideError("NO_API_KEY", NO_KEY_HINT);
 
+  // The old single-file call keeps its shape; internally every check runs on
+  // a frozen, short-lived session and reads rules only from that snapshot.
+  const ephemeralId = `short-${randomUUID()}`;
+  const opened = ensureSession({
+    sessionId: ephemeralId,
+    root,
+    rules: loaded.rules,
+    thresholds: loaded.thresholds,
+    projectSources: loaded.project?.sources ?? [],
+    globalSources: loaded.global?.sources ?? [],
+    ephemeral: true,
+  });
+  const rulesForCheck = opened?.rules ?? loaded.rules;
+  const thresholdsForCheck = opened?.snapshot.thresholds ?? loaded.thresholds;
+  const fingerprint = opened?.snapshot.fingerprint;
+  const cleanup = (): void => removeSession(ephemeralId);
+
   const patch =
     values.diff === undefined
       ? workingTreeDiff(root, positionals)
@@ -54,8 +73,8 @@ export const runCheckCommand = async (argv: string[]): Promise<number> => {
           phase: "edit",
           fileDiffs: [{ file: f.file, text: boundState(f.text).text }],
           task: values.task,
-          rules: loaded.rules,
-          thresholds: loaded.thresholds,
+          rules: rulesForCheck,
+          thresholds: thresholdsForCheck,
           timeoutMs: EDIT_CHECK_TIMEOUT_MS,
           retries: 2,
         });
@@ -78,8 +97,8 @@ export const runCheckCommand = async (argv: string[]): Promise<number> => {
         phase: "turn",
         fileDiffs: files.map((f) => ({ file: f.file, text: boundState(f.text, 8_000).text })),
         task: values.task,
-        rules: loaded.rules,
-        thresholds: loaded.thresholds,
+        rules: rulesForCheck,
+        thresholds: thresholdsForCheck,
         timeoutMs: TURN_CHECK_TIMEOUT_MS,
         retries: 2,
       });
@@ -93,12 +112,13 @@ export const runCheckCommand = async (argv: string[]): Promise<number> => {
         verdicts: out.verdicts,
       });
     }
-    return { root, sections, spendUsd, all: values.all };
+    return { root, sections, spendUsd, all: values.all, fingerprint };
   };
 
   if (values.json) {
     const data = await run(() => {});
     say(JSON.stringify(data));
+    cleanup();
     return data.sections.some((s) => s.verdicts.some((v) => v.band === "act")) ? 1 : 0;
   }
   return showLive<CheckData>({
@@ -110,5 +130,5 @@ export const runCheckCommand = async (argv: string[]): Promise<number> => {
     run,
     done: (data) => CheckView({ data }),
     code: (data) => (data.sections.some((s) => s.verdicts.some((v) => v.band === "act")) ? 1 : 0),
-  });
+  }).finally(cleanup);
 };

@@ -9,6 +9,7 @@ import { runLogin } from "./commands/login.js";
 import { runReplay } from "./commands/replay.js";
 import { runReport } from "./commands/report.js";
 import { runRubric } from "./commands/rubric.js";
+import { runSession } from "./commands/session.js";
 import { runUninstall } from "./commands/uninstall.js";
 import { showError, showStatic } from "./ui/render.js";
 import { HelpView } from "./ui/views/HelpView.js";
@@ -30,6 +31,8 @@ const main = async (): Promise<number> => {
       return runCompile(rest, true);
     case "rubric":
       return runRubric(rest);
+    case "session":
+      return runSession(rest);
     case "calibrate":
       return runCalibrate(rest);
     case "check":

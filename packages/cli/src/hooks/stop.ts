@@ -2,14 +2,18 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import {
   createBlobId,
+  createHookEventId,
+  createRulesFingerprint,
   isAbideError,
   stopInputSchema,
   turnIdOf,
   type HookOutput,
   type Rule,
+  type SessionConflict,
   type Verdict,
 } from "@coldtea/abide-schema";
 import { mergeOutcomes, runCheck, type CheckOutcome } from "../lib/checkRunner.js";
+import { appendEvidence, markSession, validateCommit, verdictRefs } from "../lib/checkSession.js";
 import {
   MAX_STOP_CHECKS_PER_TURN,
   STOP_FALLBACK_DIFF_TIMEOUT_MS,
@@ -18,13 +22,15 @@ import {
 } from "../lib/constants.js";
 import { editsCoverFile } from "../lib/coverage.js";
 import { boundState, remainingMs, unifiedDiff } from "../lib/diff.js";
-import { appendEvent } from "../lib/events.js";
+import { appendEventOnce } from "../lib/events.js";
 import { blobIdsAt, diffTrees, snapshotTree, splitDiff, type FileDiff } from "../lib/git.js";
 import { hasApiKey } from "../lib/credentials.js";
-import { loadRules } from "../lib/loadRules.js";
 import { debug } from "../lib/output.js";
-import { findRepoRoot, isExcludedPath, relativeToRoot } from "../lib/paths.js";
+import { openFrozenSession } from "../lib/frozenSession.js";
+import { loadRules } from "../lib/loadRules.js";
+import { findRepoRoot, isExcludedPath, relativeToRoot, resolveSourcePath } from "../lib/paths.js";
 import { readRegularFile, readRegularText } from "../lib/regularFile.js";
+import { hashFile } from "../lib/sources.js";
 import { flagNotice, repairReason } from "../lib/reason.js";
 import {
   clearTurn,
@@ -50,16 +56,8 @@ export type TurnDiff =
       /** Blob id at turn start per file; null if absent then, undefined if git could not say. */
       startIds: Map<string, string | null> | undefined;
     }
-  /** Part of the turn could not be read back in time. A judgment on the rest would be a judgment on a different change. */
   | { kind: "incomplete"; reason: string; missing: string[] };
 
-/**
- * Everything the turn changed. With a baseline from turn-start it is the git
- * diff between then and now, whichever tool made the change. Without one it
- * is each file's start-of-turn content against the disk, which sees only what
- * Edit and Write touched. Every diff here shares one budget, and a turn that
- * did not fit in it is reported as incomplete rather than checked in part.
- */
 export const turnDiff = (root: string, dir: string): TurnDiff => {
   const status = readBaselineStatus(dir);
   if (status === "failed" || status === "pending") {
@@ -132,6 +130,27 @@ export const turnDiff = (root: string, dir: string): TurnDiff => {
 
 type Pair = { rule: Rule; verdict: Verdict };
 
+const deliveryEventId = (sessionId: string, turnId: string | undefined, attempt: number): string =>
+  createHookEventId({ sessionId, event: "Stop", turnId, attempt });
+
+const conflictNotice = (conflicts: readonly SessionConflict[], generation: number): string => {
+  const lines = conflicts.map((conflict) => {
+    switch (conflict.kind) {
+      case "rules":
+        return `- rules changed mid-session: ${conflict.oldFingerprint.slice(0, 12)} -> ${conflict.newFingerprint.slice(0, 12)}${conflict.changedSources.length > 0 ? ` (${conflict.changedSources.join(", ")})` : ""}`;
+      case "files":
+        return `- files changed outside the recorded edits: ${conflict.drifted.join(", ")}`;
+      default:
+        return conflict;
+    }
+  });
+  return [
+    `Abide: this check session (generation ${generation}) can no longer be committed, because the view it judged against has moved:`,
+    ...lines,
+    'The verdicts above were made against the old view. Ask the user to run "abide session rebase" to open a fresh session against the current rules and files.',
+  ].join("\n");
+};
+
 export const handleStop = async (raw: unknown): Promise<HookOutput> => {
   const parsed = stopInputSchema.safeParse(raw);
   if (!parsed.success) return { kind: "silent" };
@@ -139,7 +158,8 @@ export const handleStop = async (raw: unknown): Promise<HookOutput> => {
   const started = performance.now();
   const at = new Date().toISOString();
   const root = findRepoRoot(input.cwd);
-  const dir = turnDir(input.session_id, turnIdOf(input));
+  const turnId = turnIdOf(input);
+  const dir = turnDir(input.session_id, turnId);
 
   const finish = (output: HookOutput): HookOutput => {
     if (output.kind !== "block") clearTurn(dir);
@@ -148,18 +168,26 @@ export const handleStop = async (raw: unknown): Promise<HookOutput> => {
 
   if (!hasTurnState(dir)) return finish({ kind: "silent" });
   if (stopCheckCount(dir) >= MAX_STOP_CHECKS_PER_TURN) return finish({ kind: "silent" });
+  // The host is asking again while a block decision from this same attempt
+  // is still on screen. Repeating the check would loop; let the block stand.
+  if (input.stop_hook_active === true && stopCheckCount(dir) > 0) {
+    return { kind: "silent" };
+  }
 
-  const loaded = loadRules(root);
-  for (const problem of loaded.problems) debug(problem);
-  if (loaded.rules.length === 0) return finish({ kind: "silent" });
+  const opened = openFrozenSession(input.session_id, root);
+  if (opened === undefined) return finish({ kind: "silent" });
+  const { snapshot } = opened;
+  const rules = opened.rules;
 
   const turn = turnDiff(root, dir);
   if (turn.kind === "incomplete") {
-    appendEvent(root, {
+    const eventId = `${deliveryEventId(input.session_id, turnId, stopCheckCount(dir))}:incomplete`;
+    appendEventOnce(root, input.session_id, snapshot.generation, eventId, {
       kind: "skip",
       at,
       phase: "turn",
       sessionId: input.session_id,
+      eventId,
       reason: `turn diff incomplete: ${turn.reason}`,
       files: turn.missing,
     });
@@ -171,18 +199,28 @@ export const handleStop = async (raw: unknown): Promise<HookOutput> => {
     file: f.file,
     text: boundState(f.text, 8_000).text,
   }));
+  // Versions as they stood when the judge looked at them. A file changed
+  // between this read and the commit validation is external drift.
+  const judgedAtCheck = new Map<string, string | null>();
+  for (const file of files) {
+    const text = readRegularText(path.join(root, file));
+    judgedAtCheck.set(file, text === undefined ? null : createBlobId(text));
+  }
 
-  if (!hasApiKey(root)) {
-    appendEvent(root, {
+  const deliveryAttempt = stopCheckCount(dir);
+  const stopEventId = deliveryEventId(input.session_id, turnId, deliveryAttempt);
+  const apiKey = hasApiKey(root);
+  if (!apiKey) {
+    appendEventOnce(root, input.session_id, snapshot.generation, `${stopEventId}:skip`, {
       kind: "skip",
       at,
       phase: "turn",
       sessionId: input.session_id,
+      eventId: `${stopEventId}:skip`,
       reason: "no api key",
       files,
     });
   }
-
   incrementStopChecks(dir);
   // Edit-phase rules rerun on files the edit checks did not see whole, and on
   // blocked ones: a block the agent ignored must not end the turn quietly.
@@ -202,42 +240,47 @@ export const handleStop = async (raw: unknown): Promise<HookOutput> => {
   const unchecked = bounded.filter((f) => !covered(f.file));
   const task = lastUserPrompt(input.transcript_path ?? undefined) ?? readPrompt(dir);
   let outcome: CheckOutcome;
-  try {
-    const turnOutcome = await runCheck({
-      phase: "turn",
-      fileDiffs: bounded,
-      task,
-      rules: loaded.rules,
-      thresholds: loaded.thresholds,
-      timeoutMs: TURN_CHECK_TIMEOUT_MS,
-    });
-    const editOutcomes = await Promise.all(
-      unchecked.map((f) =>
-        runCheck({
-          phase: "edit",
-          fileDiffs: [f],
-          task,
-          rules: loaded.rules,
-          thresholds: loaded.thresholds,
-          timeoutMs: TURN_CHECK_TIMEOUT_MS,
-        }),
-      ),
-    );
-    outcome = mergeOutcomes([turnOutcome, ...editOutcomes]);
-  } catch (error) {
-    appendEvent(root, {
-      kind: "error",
-      at,
-      phase: "turn",
-      sessionId: input.session_id,
-      code: isAbideError(error) ? error.code : "CHECK_FAILED",
-      message: error instanceof Error ? error.message : String(error),
-      latencyMs: Math.round(performance.now() - started),
-    });
-    return finish({ kind: "silent" });
-  }
+  if (!apiKey) {
+    // No judge this turn; the commit below still proves the frozen view held.
+    outcome = { verdicts: [], modelRules: [], calls: 0, usage: {}, modelLatencyMs: 0 };
+  } else
+    try {
+      const turnOutcome = await runCheck({
+        phase: "turn",
+        fileDiffs: bounded,
+        task,
+        rules,
+        thresholds: snapshot.thresholds,
+        timeoutMs: TURN_CHECK_TIMEOUT_MS,
+      });
+      const editOutcomes = await Promise.all(
+        unchecked.map((f) =>
+          runCheck({
+            phase: "edit",
+            fileDiffs: [f],
+            task,
+            rules,
+            thresholds: snapshot.thresholds,
+            timeoutMs: TURN_CHECK_TIMEOUT_MS,
+          }),
+        ),
+      );
+      outcome = mergeOutcomes([turnOutcome, ...editOutcomes]);
+    } catch (error) {
+      appendEventOnce(root, input.session_id, snapshot.generation, stopEventId, {
+        kind: "error",
+        at,
+        phase: "turn",
+        sessionId: input.session_id,
+        eventId: stopEventId,
+        code: isAbideError(error) ? error.code : "CHECK_FAILED",
+        message: error instanceof Error ? error.message : String(error),
+        latencyMs: Math.round(performance.now() - started),
+      });
+      return finish({ kind: "silent" });
+    }
 
-  const byId = new Map(loaded.rules.map((r) => [r.id, r]));
+  const byId = new Map(rules.map((r) => [r.id, r]));
   const pairs = (band: Verdict["band"]): Pair[] =>
     outcome.verdicts.flatMap((verdict) => {
       const rule = byId.get(verdict.ruleId);
@@ -246,20 +289,121 @@ export const handleStop = async (raw: unknown): Promise<HookOutput> => {
   const acting = pairs("act");
   const flagged = pairs("flag");
 
-  appendEvent(root, {
-    kind: "check",
-    at,
-    phase: "turn",
-    sessionId: input.session_id,
-    promptId: turnIdOf(input),
-    files,
-    rules: outcome.modelRules.length,
-    latencyMs: Math.round(performance.now() - started),
-    modelLatencyMs: outcome.modelLatencyMs,
-    usage: outcome.usage,
-    verdicts: outcome.verdicts,
-    blocked: acting.length > 0,
+  // The version the last judge actually saw. An edit judge's after-blob is
+  // the judged version even if the disk has since moved; files no edit judge
+  // saw use the turn judge's read. Either way validation compares against
+  // what was judged, never against the disk as it happens to stand now.
+  const judgedAfter = new Map<string, string | null>();
+  for (const file of files) judgedAfter.set(file, judgedAtCheck.get(file) ?? null);
+  for (const record of readChecked(dir)) {
+    if (files.includes(record.path)) judgedAfter.set(record.path, record.after);
+  }
+
+  const refs = verdictRefs(outcome.verdicts, files);
+  // Re-read what the rules would be if the session opened now. This read is
+  // only to prove they have not moved; the verdicts above still came from the
+  // frozen set. Rules are never silently swapped under a running session.
+  const current = loadRules(root);
+  const sourceOf = (origin: "project" | "global") =>
+    (origin === "project" ? current.project?.sources : current.global?.sources) ?? [];
+  const currentSnapshotSources = snapshot.sources.map((source) => ({
+    path: source.path,
+    sha: hashFile(resolveSourcePath(root, source.path)),
+  }));
+  const changedSources = currentSnapshotSources
+    .filter((now) => {
+      const before = snapshot.sources.find((source) => source.path === now.path)?.sha;
+      return now.sha !== undefined && before !== undefined && now.sha !== before;
+    })
+    .map((source) => source.path);
+  const currentFingerprint = createRulesFingerprint({
+    rules: current.rules,
+    thresholds: current.thresholds,
+    sources: [
+      ...sourceOf("project").map((source) => ({ origin: "project" as const, ...source })),
+      ...sourceOf("global").map((source) => ({ origin: "global" as const, ...source })),
+    ].map((source) => {
+      const diskSha = hashFile(resolveSourcePath(root, source.path));
+      return { path: source.path, ...(diskSha === undefined ? {} : { sha: diskSha }) };
+    }),
   });
+
+  const blobNow = (relative: string): string | null => {
+    const text = readRegularText(path.join(root, relative));
+    return text === undefined ? null : createBlobId(text);
+  };
+
+  const validation = validateCommit(
+    {
+      sessionId: input.session_id,
+      turnId: turnId ?? "turn",
+      currentFingerprint,
+      changedSources,
+      files,
+      verdicts: refs,
+      judgedAfter,
+      blobNow,
+    },
+    snapshot,
+  );
+
+  if (validation.status === "conflict") {
+    const logged = appendEventOnce(root, input.session_id, snapshot.generation, stopEventId, {
+      kind: "session-conflict",
+      at,
+      sessionId: input.session_id,
+      generation: snapshot.generation,
+      eventId: stopEventId,
+      conflicts: validation.conflicts,
+      affected: validation.affected,
+    });
+    // Same ordering as a clean commit: the audit line lands before the status
+    // flips, so a failure in between leaves no half-written conflict record.
+    if (logged) markSession(input.session_id, "conflicted", snapshot.generation);
+    for (const problem of validation.conflicts) debug(`session conflict: ${problem.kind}`);
+    return finish({
+      kind: "block",
+      reason: conflictNotice(validation.conflicts, snapshot.generation),
+    });
+  }
+
+  if (apiKey)
+    appendEventOnce(root, input.session_id, snapshot.generation, stopEventId, {
+      kind: "check",
+      at,
+      phase: "turn",
+      sessionId: input.session_id,
+      promptId: turnId,
+      eventId: stopEventId,
+      fingerprint: snapshot.fingerprint,
+      files,
+      rules: outcome.modelRules.length,
+      latencyMs: Math.round(performance.now() - started),
+      modelLatencyMs: outcome.modelLatencyMs,
+      usage: outcome.usage,
+      verdicts: outcome.verdicts,
+      blocked: acting.length > 0,
+    });
+  appendEvidence(opened.dir, turnId ?? "turn", stopEventId, {
+    kind: "turn",
+    turnId: turnId ?? "turn",
+    at,
+    eventId: stopEventId,
+    files,
+    verdicts: refs,
+  });
+
+  appendEventOnce(root, input.session_id, snapshot.generation, `${stopEventId}:commit`, {
+    kind: "session-commit",
+    at,
+    sessionId: input.session_id,
+    generation: snapshot.generation,
+    eventId: `${stopEventId}:commit`,
+    fingerprint: snapshot.fingerprint ?? currentFingerprint,
+    files,
+    verdicts: outcome.verdicts.length,
+  });
+  markSession(input.session_id, "committed", snapshot.generation);
 
   const systemMessage = flagged.length > 0 ? flagNotice("turn", flagged, files) : undefined;
   if (acting.length > 0) {

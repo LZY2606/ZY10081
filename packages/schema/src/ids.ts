@@ -27,3 +27,48 @@ export const createBlobId = (content: string | Uint8Array): string => {
 /** Key for the per-turn block counter: one rule on one file. */
 export const createBlockKey = (ruleId: string, relativePath: string): string =>
   `${ruleId}@${relativePath}`;
+
+/**
+ * Fingerprint of the compiled rules a session was opened against. One owner
+ * for the format: every drift check and report compares these strings, never
+ * a hand-rolled hash. Order-dependent: rules are a compiled list, not a set.
+ */
+export type FingerprintInput = {
+  rules: readonly {
+    id: string;
+    text: string;
+    source: { path: string; line?: number };
+    scope?: readonly string[];
+    when?: string;
+    check: unknown;
+    status: string;
+    origin?: string;
+  }[];
+  thresholds: unknown;
+  sources: readonly { path: string; sha?: string }[];
+};
+
+export const createRulesFingerprint = (input: FingerprintInput): string =>
+  createHash("sha256").update(JSON.stringify(input)).digest("hex");
+
+/**
+ * Stable identity of one delivered hook event. The same session and event id
+ * retried, or delivered by two host adapters at once, hashes equal and lands
+ * once. `attempt` separates a genuine second Stop after a repair from a retry.
+ */
+export const createHookEventId = (parts: {
+  sessionId: string;
+  event: string;
+  turnId?: string;
+  toolUseId?: string;
+  attempt?: number;
+}): string => {
+  const basis = [
+    parts.sessionId,
+    parts.event,
+    parts.turnId ?? "",
+    parts.toolUseId ?? "",
+    String(parts.attempt ?? 0),
+  ].join("\u0000");
+  return createHash("sha256").update(basis).digest("hex").slice(0, 24);
+};

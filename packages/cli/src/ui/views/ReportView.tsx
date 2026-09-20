@@ -1,5 +1,6 @@
 import { Box, Text } from "ink";
 import type { AbideEvent, Rule } from "@coldtea/abide-schema";
+import type { SessionSummary } from "../../commands/report.js";
 import { Buckets } from "../components/Buckets.js";
 import { Callout } from "../components/Callout.js";
 import { Columns } from "../components/Columns.js";
@@ -16,6 +17,7 @@ export type ReportData = {
   stats: Map<string, RuleStats>;
   dead: Rule[];
   problems: string[];
+  sessions: SessionSummary[];
 };
 
 type Check = Extract<AbideEvent, { kind: "check" }>;
@@ -66,6 +68,43 @@ export function ReportView({ data }: { data: ReportData }) {
           <Text color={palette.mist}>{p}</Text>
         </Callout>
       ))}
+
+      {data.sessions.length > 0 ? (
+        <Callout
+          tone={data.sessions.some((session) => session.status === "conflicted") ? "bad" : "ok"}
+          title={
+            data.sessions.some((session) => session.status === "conflicted")
+              ? "A check session drifted and needs a rebase"
+              : "Check sessions"
+          }
+        >
+          {data.sessions.map((session) => (
+            <Box key={`${session.sessionId}:${session.generation}`} flexDirection="column">
+              <Text color={session.status === "conflicted" ? palette.rose : palette.cloud}>
+                {session.status === "conflicted" ? glyph.cross : glyph.check} {session.sessionId}
+                <Text color={palette.ash}>
+                  {"  "}
+                  gen {session.generation} {glyph.dotSep} rules{" "}
+                  {session.fingerprint?.slice(0, 12) ?? "unknown"} {glyph.dotSep}{" "}
+                  {session.coveredFiles.length} committed{" "}
+                  {session.coveredFiles.length === 1 ? "file" : "files"} {glyph.dotSep}{" "}
+                  {session.status}
+                </Text>
+              </Text>
+              {session.conflicts.map((conflict, index) =>
+                conflict.conflicts.map((detail, detailIndex) => (
+                  <Text key={`${index}:${detailIndex}`} color={palette.ash}>
+                    {"    "}
+                    {detail.kind === "rules"
+                      ? `rules ${detail.oldFingerprint.slice(0, 12)} -> ${detail.newFingerprint.slice(0, 12)}${detail.changedSources.length > 0 ? ` (${detail.changedSources.join(", ")})` : ""}`
+                      : `files drifted: ${detail.drifted.join(", ")}`}
+                  </Text>
+                )),
+              )}
+            </Box>
+          ))}
+        </Callout>
+      ) : null}
 
       <Section title="Rules">
         <Buckets rules={data.rules} />

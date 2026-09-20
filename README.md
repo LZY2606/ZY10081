@@ -98,7 +98,9 @@ Every file is judged as if it had just been written. You get a table by rule and
 | `abide init [agent]`      | install the hooks (`claude`, `codex`, `opencode`, or every one found) |
 | `abide audit [paths]`     | judge existing files, report by rule and by file                      |
 | `abide check [paths]`     | check uncommitted changes the way the hooks would                     |
-| `abide report`            | your rules, what fired, what never fires                              |
+| `abide report`            | your rules, what fired, what never fires, and session drift           |
+| `abide session status`    | the frozen rule version, covered files and conflict state             |
+| `abide session rebase`    | open a fresh session after the rules or files moved under the checks  |
 | `abide replay <agent>`    | judge this repo's past sessions in any of the three agents            |
 | `abide compile`           | compile the rubric now instead of at the next session                 |
 | `abide calibrate`         | score every rule against your recent git history                      |
@@ -127,9 +129,18 @@ Every file is judged as if it had just been written. You get a table by rule and
 - The hooks cannot break your session. Every path exits 0, has a hard deadline, and prints only what the host expects.
 - No key or no network: the edit goes through unchecked and the miss is logged in `.abide/events.jsonl`, where `report` counts it.
 
+## One frozen view per check session
+
+A turn that touches a dozen files must not judge the first against one set of rules and the last against another. When a session starts, abide freezes one immutable snapshot: where the rules came from, a fingerprint of the compiled rules, the base commit and tree, the allowed scope, and the versions of every file known then. It is serialized to disk, owner-only, and restored after a restart. It holds no key, no absolute home path and no raw file contents.
+
+- Each hook appends its diff and its verdicts as evidence against that snapshot; no hook silently re-reads the rules.
+- Before the turn's verdicts are committed, abide proves nothing moved underneath them. If the rule fingerprint changed, or a file changed by something other than a recorded edit, the commit is refused with a conflict that names the old fingerprint, the new fingerprint, and the affected verdicts.
+- A retried hook delivery, or the same event arriving from two host adapters at once, produces exactly one event and one set of verdicts.
+- `abide session rebase` opens a new generation against the rules and files as they stand now; the old snapshot is archived, so the old verdicts stay explainable. The single-file `abide check` call keeps its shape and simply runs on an internal short session.
+
 ## How it hooks in
 
-Four hooks per agent. Session start: hash the instruction files, ask the agent to compile if they changed. Turn start: snapshot the working tree with git. After each edit: run the edit-phase rules on that hunk. End of turn: diff the whole turn against the snapshot and run the turn-phase rules, plus the edit-phase rules for anything a shell command wrote.
+Four hooks per agent. Session start: hash the instruction files, ask the agent to compile if they changed. Turn start: snapshot the working tree with git and freeze the check session against it. After each edit: run the edit-phase rules on that hunk and append it as evidence. End of turn: diff the whole turn against the snapshot, run the turn-phase rules plus the edit-phase rules for anything a shell wrote, then commit only after the frozen rules and file versions still hold.
 
 ## Uninstall
 

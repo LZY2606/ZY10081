@@ -6,7 +6,25 @@ export {
   createSourceSha,
   createBlobId,
   createBlockKey,
+  createRulesFingerprint,
+  createHookEventId,
+  type FingerprintInput,
 } from "./ids.js";
+export {
+  CHECK_SESSION_VERSION,
+  checkSessionSnapshotSchema,
+  sessionRuleSchema,
+  sessionSourceSchema,
+  sessionConflictSchema,
+  verdictRefSchema,
+  sessionValidationSchema,
+  type CheckSessionSnapshot,
+  type SessionRule,
+  type SessionSource,
+  type SessionConflict,
+  type VerdictRef,
+  type SessionValidation,
+} from "./session.js";
 export {
   RUBRIC_VERSION,
   DEFAULT_THRESHOLDS,
@@ -58,6 +76,7 @@ export {
   type StopInput,
   type PatchHunk,
   type HookOutput,
+  hookOutputSchema,
 } from "./hooks.js";
 export { hostSchema, HOSTS, type Host } from "./host.js";
 export {

@@ -1,6 +1,13 @@
 import { parseArgs } from "node:util";
-import type { AbideEvent, Rule } from "@coldtea/abide-schema";
+import type { Rule } from "@coldtea/abide-schema";
 import { readEvents } from "../lib/events.js";
+import {
+  liveSessionId,
+  readSessionStatus,
+  readSnapshot,
+  repoSessions,
+} from "../lib/checkSession.js";
+import type { AbideEvent } from "@coldtea/abide-schema";
 import { loadRules } from "../lib/loadRules.js";
 import { findRepoRoot } from "../lib/paths.js";
 import { say } from "../lib/ui.js";
@@ -26,10 +33,20 @@ const statsFrom = (events: readonly AbideEvent[]): Map<string, RuleStats> => {
 
 const MIN_CHECKS_TO_CALL_DEAD = 20;
 
+export type SessionSummary = {
+  sessionId: string;
+  generation: number;
+  status: "active" | "conflicted" | "committed";
+  fingerprint?: string;
+  coveredFiles: string[];
+  conflicts: Extract<AbideEvent, { kind: "session-conflict" }>[];
+};
+
 export const collectReport = (root: string): ReportData | undefined => {
   const loaded = loadRules(root);
   if (loaded.rules.length === 0) return undefined;
   const events = readEvents(root);
+  const sessionSummaries = summarizeSessions(root, events);
   const stats = statsFrom(events);
   // Dead means it never answers: no fire, no flag, and a calibration that
   // never cleared confidently either. A rule at 0.02 on every check is not
@@ -47,7 +64,49 @@ export const collectReport = (root: string): ReportData | undefined => {
       s.flagged === 0
     );
   });
-  return { root, rules: loaded.rules, events, stats, dead, problems: loaded.problems };
+  return {
+    root,
+    rules: loaded.rules,
+    events,
+    stats,
+    dead,
+    problems: loaded.problems,
+    sessions: sessionSummaries,
+  };
+};
+
+const summarizeSessions = (root: string, events: readonly AbideEvent[]): SessionSummary[] => {
+  // Collapse an id and the generations it was rebased into to the live one.
+  const ids = [...new Set(repoSessions(root).map((id) => liveSessionId(id)))];
+  return ids
+    .map((sessionId): SessionSummary | undefined => {
+      const snapshot = readSnapshot(sessionId);
+      if (snapshot === undefined || snapshot.ephemeral) return undefined;
+      const status = readSessionStatus(sessionId)?.status ?? "active";
+      const coveredFiles = [
+        ...new Set(
+          events
+            .filter(
+              (event): event is Extract<AbideEvent, { kind: "session-commit" }> =>
+                event.kind === "session-commit" && event.sessionId === sessionId,
+            )
+            .flatMap((event) => event.files),
+        ),
+      ].sort();
+      const conflicts = events.filter(
+        (event): event is Extract<AbideEvent, { kind: "session-conflict" }> =>
+          event.kind === "session-conflict" && event.sessionId === sessionId,
+      );
+      return {
+        sessionId,
+        generation: snapshot.generation,
+        status,
+        fingerprint: snapshot.fingerprint,
+        coveredFiles,
+        conflicts,
+      };
+    })
+    .filter((summary): summary is SessionSummary => summary !== undefined);
 };
 
 /** Rules, calibration, and what has fired so far in this repository. */
@@ -74,6 +133,14 @@ export const runReport = async (argv: string[]): Promise<number> => {
         stats: Object.fromEntries(data.stats),
         dead: data.dead.map((r) => r.id),
         events: data.events.length,
+        sessions: data.sessions.map((session) => ({
+          sessionId: session.sessionId,
+          generation: session.generation,
+          status: session.status,
+          fingerprint: session.fingerprint,
+          coveredFiles: session.coveredFiles,
+          conflicts: session.conflicts.length,
+        })),
       }),
     );
     return 0;

@@ -17,6 +17,8 @@ const TITLES: Record<AbideErrorCode, string> = {
   HOST_NOT_FOUND: "No supported agent was found on this machine",
   CHECK_TIMEOUT: "Jev did not answer in time",
   CHECK_FAILED: "Jev refused the check",
+  SESSION_CONFLICT: "The session's rules or files moved under the checks",
+  SESSION_NOT_FOUND: "No check session was found",
 };
 
 export function ErrorView({ error }: { error: unknown }) {

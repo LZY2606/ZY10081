@@ -118,3 +118,15 @@ export type HookOutput =
   | { kind: "session-context"; additionalContext: string; systemMessage?: string }
   | { kind: "block"; reason: string; systemMessage?: string }
   | { kind: "notice"; systemMessage: string };
+
+/** Disk boundary for a published hook result, replayed to retried deliveries. */
+export const hookOutputSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("silent") }),
+  z.object({
+    kind: z.literal("session-context"),
+    additionalContext: z.string(),
+    systemMessage: z.string().optional(),
+  }),
+  z.object({ kind: z.literal("block"), reason: z.string(), systemMessage: z.string().optional() }),
+  z.object({ kind: z.literal("notice"), systemMessage: z.string() }),
+]);

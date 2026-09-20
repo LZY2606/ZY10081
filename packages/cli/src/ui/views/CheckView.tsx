@@ -15,7 +15,13 @@ export type CheckSection = {
   verdicts: Verdict[];
 };
 
-export type CheckData = { root: string; sections: CheckSection[]; spendUsd: number; all: boolean };
+export type CheckData = {
+  root: string;
+  sections: CheckSection[];
+  spendUsd: number;
+  all: boolean;
+  fingerprint?: string;
+};
 
 export function CheckView({ data }: { data: CheckData }) {
   const acts = data.sections.flatMap((s) => s.verdicts).filter((v) => v.band === "act").length;
@@ -23,6 +29,13 @@ export function CheckView({ data }: { data: CheckData }) {
   return (
     <Box flexDirection="column">
       <Header command="check" where={data.root} />
+      {data.fingerprint ? (
+        <Text color={palette.ash}>
+          rules {glyph.dotSep} {data.sections.reduce((n, s) => n + s.modelRules, 0)} frozen
+          {glyph.dotSep} {data.fingerprint.slice(0, 12)} {glyph.dotSep}{" "}
+          {new Set(data.sections.flatMap((s) => s.files)).size} covered
+        </Text>
+      ) : null}
       {data.sections.map((s, i) => (
         <Section
           key={i}

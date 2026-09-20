@@ -12,6 +12,8 @@ const COMMANDS: [string, string][] = [
   ["check [paths] [--all]", "check uncommitted changes the way the hooks would"],
   ["audit [paths] [--all]", "judge every file in scope as if just written; what breaks which rule"],
   ["report", "what is compiled, what fired, what never fires"],
+  ["session status", "the frozen rule version, covered files and drift state per session"],
+  ["session rebase [id]", "open a fresh session after rules or files moved under the checks"],
   [
     "replay <agent>",
     "judge past claude, codex or opencode sessions in this repo as if abide had been installed",

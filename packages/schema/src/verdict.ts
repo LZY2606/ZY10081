@@ -31,6 +31,10 @@ export const eventSchema = z.discriminatedUnion("kind", [
     phase: checkPhaseSchema,
     sessionId: z.string().optional(),
     promptId: z.string().optional(),
+    /** Stable id of the hook delivery this event was produced from; retries share it. */
+    eventId: z.string().optional(),
+    /** Fingerprint of the frozen rules the verdicts came from. */
+    fingerprint: z.string().optional(),
     files: z.array(z.string()),
     rules: z.number().int(),
     /** Older logs counted regex rules here; abide no longer runs any. */
@@ -46,6 +50,7 @@ export const eventSchema = z.discriminatedUnion("kind", [
     at: z.string(),
     phase: checkPhaseSchema,
     sessionId: z.string().optional(),
+    eventId: z.string().optional(),
     reason: z.string(),
     files: z.array(z.string()).optional(),
   }),
@@ -54,6 +59,7 @@ export const eventSchema = z.discriminatedUnion("kind", [
     at: z.string(),
     phase: z.union([checkPhaseSchema, z.literal("session")]),
     sessionId: z.string().optional(),
+    eventId: z.string().optional(),
     code: z.string(),
     message: z.string(),
     latencyMs: z.number().optional(),
@@ -64,6 +70,41 @@ export const eventSchema = z.discriminatedUnion("kind", [
     sessionId: z.string().optional(),
     reason: z.string(),
     sources: z.array(z.string()),
+  }),
+  z.object({
+    kind: z.literal("session-conflict"),
+    at: z.string(),
+    sessionId: z.string(),
+    generation: z.number().int().min(0),
+    eventId: z.string().optional(),
+    conflicts: z
+      .array(
+        z.discriminatedUnion("kind", [
+          z.object({
+            kind: z.literal("rules"),
+            oldFingerprint: z.string(),
+            newFingerprint: z.string(),
+            changedSources: z.array(z.string()),
+          }),
+          z.object({ kind: z.literal("files"), drifted: z.array(z.string()) }),
+        ]),
+      )
+      .min(1),
+    /** Rule/file pairs whose verdicts were produced against the old view. */
+    affected: z.array(
+      z.object({ ruleId: z.string(), band: bandSchema, files: z.array(z.string()) }),
+    ),
+  }),
+  z.object({
+    kind: z.literal("session-commit"),
+    at: z.string(),
+    sessionId: z.string(),
+    generation: z.number().int().min(0),
+    eventId: z.string().optional(),
+    fingerprint: z.string(),
+    /** Repo-relative files the committed verdicts cover. */
+    files: z.array(z.string()),
+    verdicts: z.number().int().min(0),
   }),
 ]);
 export type AbideEvent = z.infer<typeof eventSchema>;
